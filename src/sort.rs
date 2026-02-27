@@ -12,6 +12,7 @@ use std::time::Instant;
 use arrow::array::{Array, ArrayIter};
 use arrow::compute::concat;
 use arrow::compute::kernels;
+use arrow::datatypes::DataType;
 use arrow::datatypes::Fields;
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaBuilder;
@@ -104,6 +105,57 @@ fn parse_number(chars: &mut std::iter::Peekable<std::str::Chars>) -> u64 {
         }
     }
     num
+}
+
+pub fn infer_schema_for_auto_sort(filename: &str, delimiter: u8) -> CsvlensResult<Schema> {
+    let schema =
+        arrow::csv::infer_schema_from_files(&[filename.to_string()], delimiter, Some(1000), true)?;
+
+    // Convert integer fields to float64 to be more permissive
+    let mut updated_fields = vec![];
+    for field in schema.fields() {
+        if field.data_type().is_integer() {
+            let new_field = field
+                .as_ref()
+                .clone()
+                .with_data_type(arrow::datatypes::DataType::Float64);
+            updated_fields.push(new_field);
+        } else {
+            updated_fields.push(field.as_ref().clone());
+        }
+    }
+    let updated_fields = Fields::from(updated_fields);
+
+    Ok(SchemaBuilder::from(updated_fields).finish())
+}
+
+pub fn infer_numeric_columns_for_auto_sort(
+    filename: &str,
+    delimiter: u8,
+) -> CsvlensResult<Vec<bool>> {
+    let schema = infer_schema_for_auto_sort(filename, delimiter)?;
+    Ok(schema
+        .fields()
+        .iter()
+        .map(|field| is_numeric_data_type(field.data_type()))
+        .collect())
+}
+
+fn is_numeric_data_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+    )
 }
 
 #[derive(Debug)]
@@ -273,29 +325,7 @@ impl SorterInternalState {
     }
 
     fn infer_schema(filename: &str, delimiter: u8) -> CsvlensResult<Schema> {
-        let schema = arrow::csv::infer_schema_from_files(
-            &[filename.to_string()],
-            delimiter,
-            Some(1000),
-            true,
-        )?;
-
-        // Convert integer fields to float64 to be more permissive
-        let mut updated_fields = vec![];
-        for field in schema.fields() {
-            if field.data_type().is_integer() {
-                let new_field = field
-                    .as_ref()
-                    .clone()
-                    .with_data_type(arrow::datatypes::DataType::Float64);
-                updated_fields.push(new_field);
-            } else {
-                updated_fields.push(field.as_ref().clone());
-            }
-        }
-        let updated_fields = Fields::from(updated_fields);
-
-        Ok(SchemaBuilder::from(updated_fields).finish())
+        infer_schema_for_auto_sort(filename, delimiter)
     }
 
     fn terminate(&mut self) {

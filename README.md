@@ -51,6 +51,7 @@ Key | Action
 `Enter` (in Cell mode) | Print the selected cell to stdout and exit
 `-S` | Toggle line wrapping
 `-W` | Toggle line wrapping by words
+`-h` | Toggle human formatting for the selected numeric column
 `f<n>` | Freeze this number of columns from the left
 `m` | Mark / unmark the selected row visually
 `M` | Clear all row marks

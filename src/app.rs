@@ -20,8 +20,10 @@ use ratatui::prelude::Position;
 use ratatui::{Frame, Terminal};
 
 use anyhow::Result;
+use human_format::Formatter;
 use regex::Regex;
 use std::cmp::min;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -183,6 +185,9 @@ pub struct App {
     sorter: Option<Arc<sort::Sorter>>,
     sort_order: SortOrder,
     wrap_mode: WrapMode,
+    human_format_columns: HashSet<usize>,
+    numeric_columns_for_auto_sort: Option<Vec<bool>>,
+    human_formatter: Formatter,
     #[cfg(feature = "clipboard")]
     clipboard: Result<Clipboard>,
     _seekable_file: SeekableFile,
@@ -288,6 +293,9 @@ impl App {
             sorter: None,
             sort_order: SortOrder::Ascending,
             wrap_mode: WrapMode::default(),
+            human_format_columns: HashSet::new(),
+            numeric_columns_for_auto_sort: None,
+            human_formatter: Formatter::new(),
             #[cfg(feature = "clipboard")]
             clipboard,
             _seekable_file: seekable_file,
@@ -538,6 +546,10 @@ impl App {
             Control::ToggleLineWrap(word_wrap) => {
                 self.handle_line_wrap_toggle(*word_wrap, true);
             }
+            Control::ToggleHumanFormat => {
+                self.csv_table_state.reset_buffer();
+                self.toggle_human_format_for_selected_column();
+            }
             Control::ToggleSort | Control::ToggleNaturalSort => {
                 if self.shared_config.is_streaming() {
                     self.transient_message.replace(
@@ -584,6 +596,7 @@ impl App {
                 self.reset_filter(false);
                 self.reset_columns_filter();
                 self.reset_sorter();
+                self.human_format_columns.clear();
             }
             Control::UnknownOption(s) => {
                 self.csv_table_state.reset_buffer();
@@ -932,6 +945,8 @@ impl App {
     }
 
     fn handle_file_changed(&mut self) -> CsvlensResult<()> {
+        self.numeric_columns_for_auto_sort = None;
+
         if self._seekable_file.stream_active().is_some() {
             // No need to rebuild states for streaming input, just reload rows. Check this instead
             // of shared_config.is_streaming() since the latter can be set to false when streaming
@@ -1071,6 +1086,79 @@ impl App {
         }
     }
 
+    fn selected_column_is_numeric_for_auto_sort(&mut self, column_index: usize) -> bool {
+        if self.numeric_columns_for_auto_sort.is_none() {
+            let inferred = sort::infer_numeric_columns_for_auto_sort(
+                self.shared_config.filename(),
+                self.shared_config.delimiter(),
+            );
+            if let Ok(columns) = inferred {
+                self.numeric_columns_for_auto_sort = Some(columns);
+            } else {
+                return false;
+            }
+        }
+
+        self.numeric_columns_for_auto_sort
+            .as_ref()
+            .and_then(|columns| columns.get(column_index))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn toggle_human_format_for_selected_column(&mut self) {
+        let Some(selected_column_index) = self
+            .get_global_selected_column_index()
+            .map(|index| index as usize)
+        else {
+            return;
+        };
+
+        if !self.selected_column_is_numeric_for_auto_sort(selected_column_index) {
+            return;
+        }
+
+        if !self.human_format_columns.insert(selected_column_index) {
+            self.human_format_columns.remove(&selected_column_index);
+        }
+    }
+
+    fn get_rows_for_render(
+        &self,
+        headers: &[view::Header],
+        rows: &[csv::Row],
+    ) -> Option<Vec<csv::Row>> {
+        if self.human_format_columns.is_empty()
+            || !headers
+                .iter()
+                .any(|header| self.human_format_columns.contains(&header.origin_index))
+        {
+            return None;
+        }
+
+        let rows = rows
+            .iter()
+            .map(|row| csv::Row {
+                record_num: row.record_num,
+                fields: row
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(column_index, value)| {
+                        if let Some(header) = headers.get(column_index)
+                            && self.human_format_columns.contains(&header.origin_index)
+                            && let Ok(parsed) = value.trim().parse::<f64>()
+                        {
+                            return self.human_formatter.format(parsed);
+                        }
+                        value.clone()
+                    })
+                    .collect(),
+            })
+            .collect();
+        Some(rows)
+    }
+
     fn render_frame(&mut self, f: &mut Frame) {
         let size = f.area();
 
@@ -1091,8 +1179,14 @@ impl App {
         self.rows_view.set_num_rows(num_rows_adjusted).unwrap();
         self.frame_width = Some(size.width);
 
+        let headers = self.rows_view.headers();
         let rows = self.rows_view.rows();
-        let csv_table = CsvTable::new(self.rows_view.headers(), rows);
+        let formatted_rows = self.get_rows_for_render(headers, rows);
+        let rows_to_render = formatted_rows
+            .as_ref()
+            .map(|rows| rows.as_slice())
+            .unwrap_or(rows.as_slice());
+        let csv_table = CsvTable::new(headers, rows_to_render);
         f.render_stateful_widget(csv_table, size, &mut self.csv_table_state);
         if let Some((x, y)) = self.csv_table_state.cursor_xy {
             f.set_cursor_position(Position::new(x, y));
@@ -1113,8 +1207,10 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::InputMode;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use tui_input::Input;
 
     struct AppBuilder {
         original_filename: Option<String>,
@@ -2463,6 +2559,75 @@ mod tests {
             "stdin [Row 86/128, Col 1/4] [Filter \"San\": -/11] [Filter \"Lat|City\": 4/10 cols] ",
         ];
         assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn test_toggle_human_format_numeric_column() {
+        let mut app = AppBuilder::new("tests/data/human_format.csv")
+            .build()
+            .unwrap();
+        till_app_ready(&app);
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        step_and_draw(&mut app, &mut terminal, Control::Nothing);
+        step_and_draw(&mut app, &mut terminal, Control::ToggleSelectionType);
+        step_and_draw(&mut app, &mut terminal, Control::ScrollRight);
+
+        let before = to_lines(&terminal.backend().buffer().clone()).join("\n");
+        assert!(before.contains("1500000"));
+
+        step_and_draw(&mut app, &mut terminal, Control::ToggleHumanFormat);
+        let after = to_lines(&terminal.backend().buffer().clone()).join("\n");
+        let expected = Formatter::new().format(1_500_000.0);
+        assert!(after.contains(expected.as_str()));
+        assert_ne!(before, after);
+
+        step_and_draw(&mut app, &mut terminal, Control::ToggleHumanFormat);
+        let after_toggle_off = to_lines(&terminal.backend().buffer().clone()).join("\n");
+        assert_eq!(before, after_toggle_off);
+    }
+
+    #[test]
+    fn test_toggle_human_format_non_numeric_column_noop() {
+        let mut app = AppBuilder::new("tests/data/human_format.csv")
+            .build()
+            .unwrap();
+        till_app_ready(&app);
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        step_and_draw(&mut app, &mut terminal, Control::Nothing);
+        step_and_draw(&mut app, &mut terminal, Control::ToggleSelectionType);
+
+        let before = to_lines(&terminal.backend().buffer().clone()).join("\n");
+        step_and_draw(&mut app, &mut terminal, Control::ToggleHumanFormat);
+        let after = to_lines(&terminal.backend().buffer().clone()).join("\n");
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn test_toggle_human_format_clears_option_prompt() {
+        let mut app = AppBuilder::new("tests/data/human_format.csv")
+            .build()
+            .unwrap();
+        till_app_ready(&app);
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        step_and_draw(&mut app, &mut terminal, Control::Nothing);
+        app.csv_table_state
+            .set_buffer(InputMode::Option, Input::new("h".to_string()));
+        terminal.draw(|f| app.render_frame(f)).unwrap();
+        let before = to_lines(&terminal.backend().buffer().clone()).join("\n");
+        assert!(before.contains("Option: h"));
+
+        step_and_draw(&mut app, &mut terminal, Control::ToggleHumanFormat);
+        let after = to_lines(&terminal.backend().buffer().clone()).join("\n");
+        assert!(!after.contains("Option:"));
     }
 
     #[test]

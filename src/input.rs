@@ -41,6 +41,7 @@ pub enum Control {
     SelectMarks,
     ToggleSelectionType,
     ToggleLineWrap(WrapMode),
+    ToggleHumanFormat,
     ToggleMark,
     ResetMarks,
     ToggleSort,
@@ -313,6 +314,10 @@ impl InputHandler {
             KeyCode::Char('W') | KeyCode::Char('w') => {
                 self.reset_buffer();
                 Control::ToggleLineWrap(WrapMode::Words)
+            }
+            KeyCode::Char('H') | KeyCode::Char('h') => {
+                self.reset_buffer();
+                Control::ToggleHumanFormat
             }
             KeyCode::Char(x) => {
                 self.reset_buffer();
